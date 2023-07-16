@@ -1,0 +1,173 @@
+//Configuración repositorio 
+def credencialesGIT = "userGitH"
+def urlGIT = "https://github.com/jacampano/pruebasWebApp.git"
+def rama = "main"
+
+// Herramientas y servidores
+def versionJDK = "JDK11"
+def versionMaven = "Maven-3.8.6"
+def dependencyCheckTool = "DC-7.3.0"
+def sonarScannerTool = "SonarScanner"
+def sonarToken = "SonarToken"
+def instalacionSonar = "SonarLab"
+
+//Condiciones ejecución fases --
+def realizarCompilacion = true
+def analizarConSonar = true
+def esperarQG = false
+def analizarConOWASP = true
+def realizarPruebasUnitarias = true
+def realizarDespliegue = true
+
+def fallarPipelineError = true
+
+node {
+    stage('Inicialización') {
+        cleanWs()
+        /*
+        // Si se ejecuta a través de un webHook de Gitlab, podríamos obtener la información de la URL del repo y la rama de las siguientes propiedades
+            urlGIT=env.gitlabSourceRepoHttpUrl
+            rama=env.gitlabBranch
+        */
+    }
+
+    stage('Descarga código fuente') {
+        echo "--- Obtener Codigo Fuente desde rama: ${rama} --"
+         git branch: rama,
+             url: urlGIT
+    }
+
+    stage('Compilación y empaquetado') {
+        if (realizarCompilacion) {
+           withMaven(
+             maven: versionMaven,
+             jdk: versionJDK
+
+           ) {
+                    echo "--- Compilación y empaquetado ---"
+                    echo "JAVA_HOME: $JAVA_HOME"
+                    sh "mvn clean package -DskipTests"
+           }
+            
+        }
+    }
+
+    stage('Pruebas de Componentes') {
+        if (analizarConSonar) {
+        stage('Analisis con Sonar') {
+            try {
+                withEnv(["SONAR_SCANNER_OPTS=-Xms512m -Xmx1024m", "JAVA_HOME=${tool versionJDK}"]) {
+                    def scannerHome = tool sonarScannerTool
+                    withSonarQubeEnv(credentialsId: sonarToken, installationName: instalacionSonar) {
+                        sh "${scannerHome}/bin/sonar-scanner -Dproject.settings=${WORKSPACE}/sonar.properties"
+                        esperarQG = true
+                    }
+                }
+            } catch (err) {
+                echo "--- EXCEPCION EN ${env.STAGE_NAME}"
+                echo "Error: ${err.toString()}"
+                currentBuild.result = 'UNSTABLE'
+            }
+        }
+        }
+
+        if (esperarQG) {
+            stage('Umbral de Calidad') {
+                    try {
+                        sleep(10) 
+                        timeout(time: 1, unit: 'MINUTES') {
+                            def qg = waitForQualityGate()
+                            if (qg.status != 'OK') {
+                                error "${qg.status}: No se ha superado el umbral requerido de calidad"
+                            }
+                        }
+                    } catch (err) {
+                        echo "--- EXCEPCION EN ${env.STAGE_NAME}"
+                        echo err.toString()
+                        currentBuild.result = 'UNSTABLE'
+                    }
+                }
+            }
+
+        if (analizarConOWASP) {
+            stage('Análisis de dependencias') {
+                try {
+                    dependencyCheck additionalArguments: '''--format ALL''', odcInstallation: dependencyCheckTool
+                } catch (err) {
+                    echo "--- EXCEPCION EN ${env.STAGE_NAME}"
+                    echo err.toString()
+                    currentBuild.result = 'UNSTABLE'
+                }
+            }
+        }
+
+        if (realizarPruebasUnitarias) {
+            stage('Ejecución pruebas unitarias') {
+                try {
+                    withMaven(
+                        maven: versionMaven,
+                        jdk: versionJDK
+                    ){
+                        sh 'mvn test'
+                        }
+                } catch (err) {
+                    echo "--- EXCEPCION EN ${env.STAGE_NAME}"
+                    echo err.toString()
+                    if (fallarPipelineError) {
+                        currentBuild.result ="FAILURE"
+                        error "--- ERROR EN ${env.STAGE_NAME}. No se continua con la construcción"
+                    } else {
+                        currentBuild.result = 'UNSTABLE'
+                    }
+                    
+                }
+           
+            }
+        }
+    } // Cierre fase "Pruebas de componentes"
+
+    stage('Deploy') {
+        if (realizarDespliegue) {
+                deploy adapters: [tomcat9(credentialsId: "robot", path: '', url: "http://lab.tomcat:8080/")], contextPath: "/pruebasWebApp", war: "**/*.war"
+        }
+    }
+
+   stage('Finalizacion') {
+        
+         /* Posibles valores currentBuild.result
+        'SUCCESS': El build se completó correctamente sin errores.
+        'UNSTABLE': El build se completó, pero algunas pruebas o verificaciones no pasaron o hubo problemas menores.
+        'FAILURE': El build falló debido a errores en la compilación, pruebas o verificaciones.
+        'ABORTED': El build se abortó manualmente antes de su finalización.
+        'NOT_BUILT': El build no se ejecutó debido a ciertas condiciones o configuraciones.
+        */
+        
+        def currentResult = currentBuild.result
+
+        switch(currentResult) {
+            case 'SUCCESS':
+                echo 'Esto se ejecuta cuando el build se ejecuta sin problemas'
+            break
+            case 'UNSTABLE':
+                echo 'Esto se ejecuta cuando el build es inestable'
+            break
+            case 'FAILURE':
+                echo 'Esto se ejecuta en caso de error'                
+            break
+            default :
+                echo "Ninguno de los anteriores"
+        }
+
+
+
+        def previousResult = currentBuild.getPreviousBuild()?.result
+        if (previousResult != null && previousResult != currentResult) {
+            echo '--- Se ejecuta solo cuando el build cambia de estado ---'
+            echo '--- Por ejemplo, si antes había falladado y en la ejecución actual termina de manera satisfactoria ---'
+        }
+
+        echo '--- SE EJECUTA SIEMPRE ---'
+      
+    }
+}
+
